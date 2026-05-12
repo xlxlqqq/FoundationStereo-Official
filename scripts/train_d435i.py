@@ -2,6 +2,7 @@
 
 import os
 import sys
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import argparse
 import logging
 import time
