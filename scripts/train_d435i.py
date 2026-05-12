@@ -337,6 +337,7 @@ def main():
     
     # Model settings
     parser.add_argument('--ckpt_dir', default=f'{code_dir}/../pretrained_models/23-51-11/model_best_bp2.pth', type=str)
+    parser.add_argument('--no_pretrained', action='store_true', default=False, help='Do not load pretrained weights, train from scratch')
     parser.add_argument('--vit_size', default='vitl', type=str, choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--low_memory', action='store_true', default=True, help='Enable low memory mode')
     parser.add_argument('--mixed_precision', action='store_true', default=True, help='Enable mixed precision training')
@@ -389,10 +390,19 @@ def main():
     cfg['mixed_precision'] = args.mixed_precision
     
     # Create model
-    logging.info(f"Loading pretrained model from {args.ckpt_dir}")
     model = FoundationStereo(cfg)
-    ckpt = torch.load(args.ckpt_dir, map_location='cpu')
-    model.load_state_dict(ckpt['model'])
+    
+    if args.no_pretrained:
+        logging.info("Training from scratch without pretrained weights")
+    else:
+        logging.info(f"Loading pretrained model from {args.ckpt_dir}")
+        # 使用 weights_only=False 因为旧的 checkpoint 包含 numpy 标量
+        # 注意：仅在信任权重文件来源时使用此选项
+        ckpt = torch.load(args.ckpt_dir, map_location='cpu', weights_only=False)
+        # 只加载匹配的权重，忽略新增的 window_attn 模块
+        model.load_state_dict(ckpt['model'], strict=False)
+        logging.info("Loaded pretrained weights (ignoring new window_attn layers)")
+    
     model.cuda()
     
     # Create optimizer (only train selected layers)
@@ -446,6 +456,11 @@ def main():
             # Compute total metric
             total = val_results['epe'] + val_results['l1'] + val_results['d1_3px'] + val_results['d1_5pct']
             
+            # Update best EPE first before logging
+            is_best = val_results['epe'] < best_epe
+            if is_best:
+                best_epe = val_results['epe']
+            
             logging.info(f"Epoch {epoch}/{args.epochs} - Time: {epoch_time:.1f}s - Best EPE: {best_epe:.4f}")
             logging.info(f"  d1_3px: {val_results['d1_3px']:.4f}")
             logging.info(f"  d1_5pct: {val_results['d1_5pct']:.4f}")
@@ -463,8 +478,7 @@ def main():
                 writer.add_scalar('val/total', total, epoch)
             
             # Save best model
-            if val_results['epe'] < best_epe:
-                best_epe = val_results['epe']
+            if is_best:
                 save_path = os.path.join(args.out_dir, 'model_best.pth')
                 torch.save({
                     'epoch': epoch,
@@ -479,18 +493,18 @@ def main():
             # Plot metrics every epoch
             plot_metrics(epochs_list, train_metrics, val_metrics, args.out_dir)
         
-        # Save checkpoint periodically
-        if epoch % args.save_interval == 0:
-            save_path = os.path.join(args.out_dir, f'model_epoch_{epoch}.pth')
-            torch.save({
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict() if args.mixed_precision else None,
-                'best_epe': best_epe,
-                'cfg': cfg
-            }, save_path)
-            logging.info(f"Saved checkpoint to {save_path}")
+        # # Save checkpoint periodically
+        # if epoch % args.save_interval == 0:
+        #     save_path = os.path.join(args.out_dir, f'model_epoch_{epoch}.pth')
+        #     torch.save({
+        #         'epoch': epoch,
+        #         'model': model.state_dict(),
+        #         'optimizer': optimizer.state_dict(),
+        #         'scaler': scaler.state_dict() if args.mixed_precision else None,
+        #         'best_epe': best_epe,
+        #         'cfg': cfg
+        #     }, save_path)
+        #     logging.info(f"Saved checkpoint to {save_path}")
     
     writer.close()
     

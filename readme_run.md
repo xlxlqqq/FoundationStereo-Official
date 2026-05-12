@@ -8,4 +8,5 @@ python scripts/run_demo.py --left_file ./assets/left.png --right_file ./assets/r
 
 ### 训练ir图像
 python scripts/train_d435i.py --epochs 500 --batch_size 2 --lr 1e-4 --out_dir ./train_output_ir/
-python scripts/train_d435i.py --epochs 500 --batch_size 4 --accum_steps 4 --img_scale 0.5 --low_memory --mixed_precision --out_dir ./train_output_ir/
+python scripts/train_d435i.py --epochs 500 --batch_size 4 --accum_steps 4 --img_scale 0.3 --low_memory --mixed_precision --out_dir ./train_output_ir/
+
