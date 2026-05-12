@@ -14,6 +14,7 @@ code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f'{code_dir}/../')
 import numpy as np
 from core.submodule import LayerNorm2d, BasicConv, Conv2x_IN
+from core.my_modules import WindowAttentionBlock
 from Utils import get_resize_keep_aspect_ratio, freeze_model
 import timm
 
@@ -343,6 +344,15 @@ class Feature(nn.Module):
           ResidualBlock(chans[0]*2+vit_feat_dim, chans[0]*2+vit_feat_dim, norm_fn='instance'),
         )
 
+        # Window Attention Block 插入在 1/4 分辨率特征之后
+        # 增强弱纹理/重复纹理区域的特征表达能力
+        self.window_attn = WindowAttentionBlock(
+            dim=chans[0],  # x4 的通道数为 48
+            num_heads=4,   # 48 / 4 = 12 head_dim，符合要求
+            window_size=8, # 窗口大小为 8x8
+            ffn_ratio=2    # 轻量化配置
+        )
+
         self.patch_size = 14
         self.d_out = [chans[0]*2+vit_feat_dim, chans[1]*2, chans[2]*2, chans[3]]
 
@@ -358,6 +368,11 @@ class Feature(nn.Module):
         vit_feat = F.interpolate(vit_feat, size=(H//4,W//4), mode='bilinear', align_corners=True)
         x = self.stem(x)
         x4 = self.stages[0](x)
+        
+        # 在 1/4 分辨率特征后插入 Window Attention
+        # 增强局部上下文建模，提升弱纹理/重复纹理区域匹配能力
+        x4 = self.window_attn(x4)
+        
         x8 = self.stages[1](x4)
         x16 = self.stages[2](x8)
         x32 = self.stages[3](x16)
