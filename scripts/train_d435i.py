@@ -5,6 +5,7 @@ import sys
 import argparse
 import logging
 import time
+import datetime
 import json
 import numpy as np
 import torch
@@ -355,25 +356,26 @@ def main():
     parser.add_argument('--log_interval', default=10, type=int)
     parser.add_argument('--val_interval', default=1, type=int)
     parser.add_argument('--save_interval', default=10, type=int)
-    parser.add_argument('--out_dir', default=f'{code_dir}/../train_output', type=str)
+    parser.add_argument('--out_dir', default=f'{code_dir}/../train_output_ir', type=str)
     
     args = parser.parse_args()
+    
+    # Append timestamp subdirectory so each run saves to a separate folder
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M')
+    args.out_dir = os.path.join(args.out_dir, timestamp)
     
     # Setup logging
     os.makedirs(args.out_dir, exist_ok=True)
     
     # Configure logging to file and console
+    # NOTE: set_logging_format() reloads the logging module, so FileHandler must be
+    # added AFTER that call, otherwise it gets destroyed by the reload.
     log_file = os.path.join(args.out_dir, 'train.log')
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    
     set_logging_format()
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter('%(message)s'))
+    logging.getLogger().addHandler(file_handler)
     set_seed(0)
     
     if HAS_TENSORBOARD:
