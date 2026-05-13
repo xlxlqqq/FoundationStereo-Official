@@ -21,7 +21,7 @@ from core.submodule import (
     BasicConv, Conv3dNormActReduced, CostVolumeDisparityAttention, FeatureAtt,
     SpatialAttentionExtractor, ChannelAttentionEnhancement, BasicConv_IN, Conv2x,
     ResnetBasicBlock3D, build_gwc_volume, build_concat_volume, disparity_regression,
-    context_upsample
+    context_upsample, LightDisparityTransformerLinear, LightDisparityTransformerMamba
 )
 from core.utils.utils import InputPadder
 # from Utils import *
@@ -85,9 +85,45 @@ class hourglass(nn.Module):
         self.agg_1 = nn.Sequential(BasicConv(in_channels*4, in_channels*2, is_3d=True, kernel_size=1, padding=0, stride=1),
                                    Conv3dNormActReduced(in_channels*2, in_channels*2, kernel_size=3, kernel_disp=17),
                                    Conv3dNormActReduced(in_channels*2, in_channels*2, kernel_size=3, kernel_disp=17))
-        self.atts = nn.ModuleDict({
-          "4": CostVolumeDisparityAttention(d_model=in_channels, nhead=4, dim_feedforward=in_channels, norm_first=False, num_transformer=4, max_len=self.cfg['max_disp']//16),
-        })
+        
+        # Choose DT module based on configuration
+        self.use_light_dt = cfg.get('use_light_dt', False)
+        self.light_dt_type = cfg.get('light_dt_type', 'linear')  # 'linear' or 'mamba'
+        
+        if self.use_light_dt:
+            # Use lightweight Disparity Transformer (Linear Attention or Mamba)
+            if self.light_dt_type == 'mamba':
+                self.atts = nn.ModuleDict({
+                    "4": LightDisparityTransformerMamba(
+                        d_model=in_channels, 
+                        dim_feedforward=in_channels, 
+                        num_layers=4, 
+                        max_len=self.cfg['max_disp']//16
+                    ),
+                })
+            else:
+                # Default to Linear Attention
+                self.atts = nn.ModuleDict({
+                    "4": LightDisparityTransformerLinear(
+                        d_model=in_channels, 
+                        dim_feedforward=in_channels, 
+                        num_layers=4, 
+                        max_len=self.cfg['max_disp']//16
+                    ),
+                })
+        else:
+            # Use original Disparity Transformer with standard MHSA
+            self.atts = nn.ModuleDict({
+              "4": CostVolumeDisparityAttention(
+                  d_model=in_channels, 
+                  nhead=4, 
+                  dim_feedforward=in_channels, 
+                  norm_first=False, 
+                  num_transformer=4, 
+                  max_len=self.cfg['max_disp']//16
+              ),
+            })
+        
         self.conv_patch = nn.Sequential(
           nn.Conv3d(in_channels, in_channels, kernel_size=4, stride=4, padding=0, groups=in_channels),
           nn.BatchNorm3d(in_channels),

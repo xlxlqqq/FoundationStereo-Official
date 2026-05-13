@@ -344,6 +344,10 @@ def main():
     parser.add_argument('--low_memory', action='store_true', default=True, help='Enable low memory mode')
     parser.add_argument('--mixed_precision', action='store_true', default=True, help='Enable mixed precision training')
     
+    # Lightweight Disparity Transformer settings
+    parser.add_argument('--use_light_dt', action='store_true', default=False, help='Use lightweight Disparity Transformer (Linear Attention or Mamba)')
+    parser.add_argument('--light_dt_type', default='linear', type=str, choices=['linear', 'mamba'], help='Type of lightweight DT: linear (Linear Attention) or mamba (Mamba)')
+    
     # Training settings
     parser.add_argument('--epochs', default=500, type=int)
     parser.add_argument('--batch_size', default=1, type=int, help='Per-GPU batch size')
@@ -391,6 +395,10 @@ def main():
     cfg['valid_iters'] = args.valid_iters
     cfg['low_memory'] = args.low_memory
     cfg['mixed_precision'] = args.mixed_precision
+    
+    # Lightweight DT settings
+    cfg['use_light_dt'] = args.use_light_dt
+    cfg['light_dt_type'] = args.light_dt_type
     
     # Create model
     model = FoundationStereo(cfg)

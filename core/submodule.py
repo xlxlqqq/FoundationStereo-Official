@@ -524,6 +524,161 @@ class CostVolumeDisparityAttention(nn.Module):
     return x
 
 
+class LinearAttention(nn.Module):
+    """
+    Linear Attention implementation with ELU approximation.
+    Complexity: O(D) instead of O(D^2) for standard self-attention.
+    Reference: "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"
+    """
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, act=nn.GELU):
+        super().__init__()
+        self.d_model = d_model
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.act = act()
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        @x: (B*H*W, D, C) sequence along disparity dimension
+        """
+        # Linear Attention with ELU+1 kernel
+        B, N, C = x.shape
+        
+        Q = self.q_proj(x)  # (B, N, C)
+        K = self.k_proj(x)  # (B, N, C)
+        V = self.v_proj(x)  # (B, N, C)
+        
+        # ELU + 1 kernel for positive attention weights
+        Q = F.elu(Q) + 1.0
+        K = F.elu(K) + 1.0
+        
+        # Compute attention output in O(N) time
+        KV = torch.einsum('bnd,bnm->bdm', K, V)  # (B, C, C)
+        Z = 1.0 / (torch.einsum('bnd,bd->bn', Q, K.sum(dim=1)) + 1e-8)  # (B, N)
+        attn_out = torch.einsum('bnd,bdm,bn->bnm', Q, KV, Z)  # (B, N, C)
+        
+        # Residual + norm
+        x = x + self.dropout1(attn_out)
+        x = self.norm1(x)
+        
+        # FFN
+        x2 = self.linear2(self.dropout(self.act(self.linear1(x))))
+        x = x + self.dropout2(x2)
+        x = self.norm2(x)
+        
+        return x
+
+
+class LightDisparityTransformerLinear(nn.Module):
+    """
+    Lightweight Disparity Transformer using Linear Attention.
+    Reduces memory usage from O(D^2) to O(D) along disparity dimension.
+    """
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, act=nn.GELU, num_layers=4, max_len=512, resize_embed=False):
+        super().__init__()
+        self.resize_embed = resize_embed
+        self.layers = nn.ModuleList([
+            LinearAttention(d_model, dim_feedforward, dropout, act) 
+            for _ in range(num_layers)
+        ])
+        self.pos_embed0 = PositionalEmbedding(d_model, max_len=max_len)
+
+    def forward(self, cv, window_size=(-1,-1)):
+        """
+        @cv: (B,C,D,H,W) where D is max disparity
+        Reshape logic: (B,C,D,H,W) -> (B*H*W, D, C) -> apply linear attention -> (B,C,D,H,W)
+        """
+        B, C, D, H, W = cv.shape
+        
+        # Reshape: (B,C,D,H,W) -> (B*H*W, D, C) for sequence processing along disparity
+        x = cv.permute(0, 3, 4, 2, 1).reshape(B * H * W, D, C)
+        
+        # Add positional encoding along disparity axis
+        x = self.pos_embed0(x, resize_embed=self.resize_embed)
+        
+        # Apply linear attention layers
+        for layer in self.layers:
+            x = layer(x)
+        
+        # Reshape back: (B*H*W, D, C) -> (B,C,D,H,W)
+        x = x.reshape(B, H, W, D, C).permute(0, 4, 3, 1, 2)
+        
+        return x
+
+
+class LightDisparityTransformerMamba(nn.Module):
+    """
+    Lightweight Disparity Transformer using Mamba (State Space Model).
+    Mamba provides O(N) complexity and better long-range modeling than transformers.
+    """
+    def __init__(self, d_model, dim_feedforward, dropout=0.1, num_layers=4, max_len=512, resize_embed=False):
+        super().__init__()
+        self.resize_embed = resize_embed
+        
+        try:
+            from mamba_ssm import Mamba
+            self.mamba_layers = nn.ModuleList([
+                Mamba(
+                    d_model=d_model,
+                    d_state=dim_feedforward // 4,  # SSM state dimension
+                    d_conv=4,  # Local convolution width
+                    expand=2,  # Expansion factor for the hidden state
+                ) for _ in range(num_layers)
+            ])
+            self.use_mamba = True
+        except ImportError:
+            # Fallback to linear attention if mamba is not available
+            self.mamba_layers = nn.ModuleList([
+                LinearAttention(d_model, dim_feedforward, dropout)
+                for _ in range(num_layers)
+            ])
+            self.use_mamba = False
+        
+        self.pos_embed0 = PositionalEmbedding(d_model, max_len=max_len)
+        
+        # Layer norms for Mamba stability
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_layers)])
+
+    def forward(self, cv, window_size=(-1,-1)):
+        """
+        @cv: (B,C,D,H,W) where D is max disparity
+        Reshape logic: (B,C,D,H,W) -> (B*H*W, D, C) -> apply Mamba -> (B,C,D,H,W)
+        """
+        B, C, D, H, W = cv.shape
+        
+        # Reshape: (B,C,D,H,W) -> (B*H*W, D, C) for sequence processing along disparity
+        x = cv.permute(0, 3, 4, 2, 1).reshape(B * H * W, D, C)
+        
+        # Add positional encoding along disparity axis
+        x = self.pos_embed0(x, resize_embed=self.resize_embed)
+        
+        # Apply Mamba/Linear layers
+        for i, layer in enumerate(self.mamba_layers):
+            residual = x
+            x = layer(x)
+            if self.use_mamba:
+                x = self.norms[i](x + residual)
+            else:
+                x = x + residual
+        
+        # Reshape back: (B*H*W, D, C) -> (B,C,D,H,W)
+        x = x.reshape(B, H, W, D, C).permute(0, 4, 3, 1, 2)
+        
+        return x
+
+
 
 class ChannelAttentionEnhancement(nn.Module):
     def __init__(self, in_planes, ratio=16):
