@@ -585,3 +585,81 @@ class EdgeNextConvEncoder(nn.Module):
 
         x = input + x
         return x
+
+
+class LightweightResidualDenseAggregationBlock(nn.Module):
+    """
+    Lightweight Residual Dense Aggregation (Light-RDA) block for 3D cost volume.
+    
+    Designed to enhance cost aggregation with minimal memory and computation overhead:
+    - Small-scale dense connection (2-3 layers only)
+    - Channel compression via 1x1x1 Conv
+    - Residual connection for training stability
+    - Maintains input/output shape consistency
+    
+    Args:
+        in_channels: Input channel dimension
+        growth_rate: Growth rate for dense layers (small value recommended: 4 or 8)
+        num_layers: Number of dense layers (2-3 recommended)
+        norm_layer: Normalization layer type (default: nn.BatchNorm3d)
+        activation: Activation function (default: nn.ReLU)
+    """
+    def __init__(self, in_channels, growth_rate=4, num_layers=2, norm_layer=nn.BatchNorm3d, activation=nn.ReLU):
+        super().__init__()
+        self.in_channels = in_channels
+        self.growth_rate = growth_rate
+        self.num_layers = num_layers
+        
+        self.dense_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+        self.act_layers = nn.ModuleList()
+        
+        for i in range(num_layers):
+            # Each dense layer takes concatenated input from all previous layers
+            layer_in_channels = in_channels + i * growth_rate
+            self.dense_layers.append(nn.Conv3d(layer_in_channels, growth_rate, kernel_size=3, padding=1, bias=False))
+            self.norm_layers.append(norm_layer(growth_rate))
+            self.act_layers.append(activation(inplace=True))
+        
+        # Channel compression layer to restore original channel count
+        total_out_channels = in_channels + num_layers * growth_rate
+        self.channel_compress = nn.Conv3d(total_out_channels, in_channels, kernel_size=1, bias=False)
+        self.compression_norm = norm_layer(in_channels)
+        
+        # Final activation after residual connection
+        self.final_act = activation(inplace=True)
+    
+    def forward(self, x):
+        """
+        Forward pass of Light-RDA block.
+        
+        Args:
+            x: Input tensor with shape (B, C, D, H, W)
+        
+        Returns:
+            Output tensor with same shape as input (B, C, D, H, W)
+        """
+        residual = x
+        features = [x]
+        
+        for i in range(self.num_layers):
+            # Concatenate all previous features
+            concat_features = torch.cat(features, dim=1)
+            # Apply dense layer
+            out = self.dense_layers[i](concat_features)
+            out = self.norm_layers[i](out)
+            out = self.act_layers[i](out)
+            features.append(out)
+        
+        # Concatenate all features including original input
+        final_concat = torch.cat(features, dim=1)
+        
+        # Channel compression to restore original dimension
+        out = self.channel_compress(final_concat)
+        out = self.compression_norm(out)
+        
+        # Residual connection
+        out = out + residual
+        out = self.final_act(out)
+        
+        return out

@@ -21,7 +21,7 @@ from core.submodule import (
     BasicConv, Conv3dNormActReduced, CostVolumeDisparityAttention, FeatureAtt,
     SpatialAttentionExtractor, ChannelAttentionEnhancement, BasicConv_IN, Conv2x,
     ResnetBasicBlock3D, build_gwc_volume, build_concat_volume, disparity_regression,
-    context_upsample
+    context_upsample, LightweightResidualDenseAggregationBlock
 )
 from core.utils.utils import InputPadder
 # from Utils import *
@@ -52,6 +52,12 @@ class hourglass(nn.Module):
     def __init__(self, cfg, in_channels, feat_dims=None):
         super().__init__()
         self.cfg = cfg
+        
+        # Light-RDA configuration
+        self.use_light_rda = cfg.get('use_light_rda', False)
+        self.light_rda_growth_rate = cfg.get('light_rda_growth_rate', 4)
+        self.light_rda_layers = cfg.get('light_rda_layers', 2)
+        
         self.conv1 = nn.Sequential(BasicConv(in_channels, in_channels*2, is_3d=True, bn=True, relu=True, kernel_size=3,
                                              padding=1, stride=2, dilation=1),
                                    Conv3dNormActReduced(in_channels*2, in_channels*2, kernel_size=3, kernel_disp=17))
@@ -85,6 +91,21 @@ class hourglass(nn.Module):
         self.agg_1 = nn.Sequential(BasicConv(in_channels*4, in_channels*2, is_3d=True, kernel_size=1, padding=0, stride=1),
                                    Conv3dNormActReduced(in_channels*2, in_channels*2, kernel_size=3, kernel_disp=17),
                                    Conv3dNormActReduced(in_channels*2, in_channels*2, kernel_size=3, kernel_disp=17))
+        
+        # Light-RDA blocks for enhanced cost aggregation
+        # Applied at 1/16 and 1/8 scale stages (conv2 and conv1 levels)
+        if self.use_light_rda:
+            self.light_rda_16x = LightweightResidualDenseAggregationBlock(
+                in_channels=in_channels*4, 
+                growth_rate=self.light_rda_growth_rate,
+                num_layers=self.light_rda_layers
+            )
+            self.light_rda_8x = LightweightResidualDenseAggregationBlock(
+                in_channels=in_channels*2, 
+                growth_rate=self.light_rda_growth_rate,
+                num_layers=self.light_rda_layers
+            )
+        
         self.atts = nn.ModuleDict({
           "4": CostVolumeDisparityAttention(d_model=in_channels, nhead=4, dim_feedforward=in_channels, norm_first=False, num_transformer=4, max_len=self.cfg['max_disp']//16),
         })
@@ -112,11 +133,21 @@ class hourglass(nn.Module):
         conv3_up = self.conv3_up(conv3)
         conv2 = torch.cat((conv3_up, conv2), dim=1)
         conv2 = self.agg_0(conv2)
+        
+        # Apply Light-RDA at 1/16 scale
+        if self.use_light_rda:
+            conv2 = self.light_rda_16x(conv2)
+        
         conv2 = self.feature_att_up_16(conv2, features[2])
 
         conv2_up = self.conv2_up(conv2)
         conv1 = torch.cat((conv2_up, conv1), dim=1)
         conv1 = self.agg_1(conv1)
+        
+        # Apply Light-RDA at 1/8 scale
+        if self.use_light_rda:
+            conv1 = self.light_rda_8x(conv1)
+        
         conv1 = self.feature_att_up_8(conv1, features[1])
 
         conv = self.conv1_up(conv1)
