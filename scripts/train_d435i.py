@@ -160,6 +160,21 @@ def compute_metrics(pred_disp, gt_disp, mask):
         'valid_ratio': valid_ratio
     }
 
+def compute_edge_mask_from_disp(disp, threshold=1.0):
+    """从视差图计算边缘掩码（深度不连续区域）"""
+    # 计算水平和垂直梯度
+    grad_x = torch.abs(disp[:, :, :, 1:] - disp[:, :, :, :-1])
+    grad_y = torch.abs(disp[:, :, 1:, :] - disp[:, :, :-1, :])
+    
+    # 扩展到原始尺寸
+    grad_x = F.pad(grad_x, (0, 1, 0, 0), mode='replicate')
+    grad_y = F.pad(grad_y, (0, 0, 0, 1), mode='replicate')
+    
+    # 合并梯度
+    edge_mask = (grad_x > threshold) | (grad_y > threshold)
+    return edge_mask.float()
+
+
 def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=None):
     model.train()
     total_loss = 0.0
@@ -167,10 +182,17 @@ def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=
     total_l1 = 0.0
     total_d1_3px = 0.0
     total_d1_5pct = 0.0
+    total_edge_loss = 0.0
     total_samples = 0
     
     start_time = time.time()
     accum_iter = 0
+    
+    # EARR 相关参数
+    use_earr = getattr(model, 'use_earr', False)
+    edge_weight = 2.0  # 边缘像素权重
+    non_edge_weight = 0.5  # 非边缘像素权重
+    edge_supervision_weight = 0.1  # 边缘监督损失权重
     
     for batch_idx, (left, right, disp_gt, mask) in enumerate(train_loader):
         left = left.cuda().float()
@@ -181,10 +203,44 @@ def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=
         # Mixed precision forward pass
         if args.mixed_precision and scaler is not None:
             with torch.cuda.amp.autocast(True):
-                init_disp, disp_preds = model(left, right, iters=args.train_iters, low_memory=args.low_memory)
+                if use_earr:
+                    init_disp, disp_preds, edge_map, edge_loss = model(
+                        left, right, iters=args.train_iters, 
+                        low_memory=args.low_memory,
+                        return_edge_info=True
+                    )
+                else:
+                    init_disp, disp_preds = model(
+                        left, right, iters=args.train_iters, 
+                        low_memory=args.low_memory
+                    )
+                    edge_map = None
+                    edge_loss = None
+                
                 disp_pred = disp_preds[-1].squeeze(1)
                 valid = (mask > 0) & (disp_gt > 0) & (disp_gt < 100)
+                
+                # 基础 L1 损失
                 loss = F.l1_loss(disp_pred[valid], disp_gt[valid])
+                
+                # Edge-weighted auxiliary loss
+                if use_earr and edge_map is not None:
+                    # 计算边缘掩码（基于GT视差）
+                    edge_mask_gt = compute_edge_mask_from_disp(disp_gt.unsqueeze(1))
+                    edge_mask_gt = edge_mask_gt.squeeze(1)
+                    
+                    # 加权损失：边缘像素权重更高
+                    weight_map = edge_mask_gt * edge_weight + (1 - edge_mask_gt) * non_edge_weight
+                    weight_map = weight_map[valid]
+                    
+                    # 边缘加权损失
+                    diff = torch.abs(disp_pred[valid] - disp_gt[valid])
+                    edge_weighted_loss = torch.mean(diff * weight_map)
+                    loss = loss + edge_weighted_loss
+                    
+                    # 边缘监督损失（Sobel梯度匹配）
+                    if edge_loss is not None:
+                        loss = loss + edge_supervision_weight * edge_loss
             
             # Gradient accumulation
             loss = loss / args.accum_steps
@@ -198,10 +254,44 @@ def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=
                 accum_iter = 0
         else:
             # Forward pass without mixed precision
-            init_disp, disp_preds = model(left, right, iters=args.train_iters, low_memory=args.low_memory)
+            if use_earr:
+                init_disp, disp_preds, edge_map, edge_loss = model(
+                    left, right, iters=args.train_iters, 
+                    low_memory=args.low_memory,
+                    return_edge_info=True
+                )
+            else:
+                init_disp, disp_preds = model(
+                    left, right, iters=args.train_iters, 
+                    low_memory=args.low_memory
+                )
+                edge_map = None
+                edge_loss = None
+            
             disp_pred = disp_preds[-1].squeeze(1)
             valid = (mask > 0) & (disp_gt > 0) & (disp_gt < 100)
+            
+            # 基础 L1 损失
             loss = F.l1_loss(disp_pred[valid], disp_gt[valid])
+            
+            # Edge-weighted auxiliary loss
+            if use_earr and edge_map is not None:
+                # 计算边缘掩码（基于GT视差）
+                edge_mask_gt = compute_edge_mask_from_disp(disp_gt.unsqueeze(1))
+                edge_mask_gt = edge_mask_gt.squeeze(1)
+                
+                # 加权损失：边缘像素权重更高
+                weight_map = edge_mask_gt * edge_weight + (1 - edge_mask_gt) * non_edge_weight
+                weight_map = weight_map[valid]
+                
+                # 边缘加权损失
+                diff = torch.abs(disp_pred[valid] - disp_gt[valid])
+                edge_weighted_loss = torch.mean(diff * weight_map)
+                loss = loss + edge_weighted_loss
+                
+                # 边缘监督损失（Sobel梯度匹配）
+                if edge_loss is not None:
+                    loss = loss + edge_supervision_weight * edge_loss
             
             # Gradient accumulation
             loss = loss / args.accum_steps
@@ -217,6 +307,8 @@ def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=
         metrics = compute_metrics(disp_pred, disp_gt, mask)
         
         total_loss += loss.item() * args.accum_steps * left.shape[0]
+        if use_earr and edge_loss is not None:
+            total_edge_loss += edge_loss.item() * left.shape[0]
         total_epe += metrics['epe'].item() * left.shape[0]
         total_l1 += metrics['l1'].item() * left.shape[0]
         total_d1_3px += metrics['d1_3px'].item() * left.shape[0]
@@ -228,7 +320,11 @@ def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=
             avg_loss = total_loss / total_samples
             avg_epe = total_epe / total_samples
             avg_l1 = total_l1 / total_samples
-            logging.info(f"Epoch {epoch}/{args.epochs} - Batch {batch_idx}/{len(train_loader)} - Loss: {avg_loss:.4f} - EPE: {avg_epe:.4f} - L1: {avg_l1:.4f}")
+            log_str = f"Epoch {epoch}/{args.epochs} - Batch {batch_idx}/{len(train_loader)} - Loss: {avg_loss:.4f} - EPE: {avg_epe:.4f} - L1: {avg_l1:.4f}"
+            if use_earr:
+                avg_edge_loss = total_edge_loss / total_samples if total_samples > 0 else 0.0
+                log_str += f" - EdgeLoss: {avg_edge_loss:.4f}"
+            logging.info(log_str)
     
     epoch_time = time.time() - start_time
     avg_loss = total_loss / total_samples
@@ -243,6 +339,9 @@ def train_one_epoch(model, train_loader, optimizer, epoch, args, writer, scaler=
         writer.add_scalar('train/l1', avg_l1, epoch)
         writer.add_scalar('train/d1_3px', avg_d1_3px, epoch)
         writer.add_scalar('train/d1_5pct', avg_d1_5pct, epoch)
+        if use_earr:
+            avg_edge_loss = total_edge_loss / total_samples if total_samples > 0 else 0.0
+            writer.add_scalar('train/edge_loss', avg_edge_loss, epoch)
     
     return avg_loss, avg_epe, avg_l1, avg_d1_3px, avg_d1_5pct, epoch_time
 
@@ -343,6 +442,7 @@ def main():
     parser.add_argument('--vit_size', default='vitl', type=str, choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--low_memory', action='store_true', default=True, help='Enable low memory mode')
     parser.add_argument('--mixed_precision', action='store_true', default=True, help='Enable mixed precision training')
+    parser.add_argument('--use_earr', action='store_true', default=True, help='Enable Edge-Aware Residual Refinement (EARR) module')
     
     # Training settings
     parser.add_argument('--epochs', default=500, type=int)
@@ -391,6 +491,7 @@ def main():
     cfg['valid_iters'] = args.valid_iters
     cfg['low_memory'] = args.low_memory
     cfg['mixed_precision'] = args.mixed_precision
+    cfg['use_earr'] = args.use_earr
     
     # Create model
     model = FoundationStereo(cfg)
@@ -435,6 +536,7 @@ def main():
     logging.info(f"Image scale: {args.img_scale}")
     logging.info(f"Low memory mode: {args.low_memory}")
     logging.info(f"Mixed precision: {args.mixed_precision}")
+    logging.info(f"Edge-Aware Residual Refinement (EARR): {args.use_earr}")
     
     for epoch in range(1, args.epochs + 1):
         # Train

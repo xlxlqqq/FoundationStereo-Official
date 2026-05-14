@@ -23,6 +23,7 @@ from core.submodule import (
     ResnetBasicBlock3D, build_gwc_volume, build_concat_volume, disparity_regression,
     context_upsample
 )
+from core.edge_refinement import EdgeAwareRefinement
 from core.utils.utils import InputPadder
 # from Utils import *
 import time,huggingface_hub
@@ -146,7 +147,9 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
         self.context_zqr_convs = nn.ModuleList([nn.Conv2d(context_dims[i], args.hidden_dims[i]*3, kernel_size=3, padding=3//2) for i in range(self.args.n_gru_layers)])
 
+        # 特征提取器需要先初始化（其他层依赖其输出维度）
         self.feature = Feature(args)
+        
         self.proj_cmb = nn.Conv2d(self.feature.d_out[0], 12, kernel_size=1, padding=0)
 
         self.stem_2 = nn.Sequential(
@@ -165,6 +168,15 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         self.spx_gru = nn.Sequential(
           nn.ConvTranspose2d(2*32, 9, kernel_size=4, stride=2, padding=1),
           )
+
+        # Edge-Aware Residual Refinement (EARR) module
+        self.use_earr = self.args.get('use_earr', True)
+        if self.use_earr:
+            # 使用特征提取器的实际输出维度作为 EARR 的输入维度
+            self.earr = EdgeAwareRefinement(
+                feat_dim=self.feature.d_out[0],
+                residual_channels=64
+            )
 
 
         self.corr_stem = nn.Sequential(
@@ -197,7 +209,7 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         return up_disp.float()
 
 
-    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False, low_memory=False, init_disp=None):
+    def forward(self, image1, image2, iters=12, flow_init=None, test_mode=False, low_memory=False, init_disp=None, return_edge_info=False):
         """ Estimate disparity between pair of frames """
         B = len(image1)
         low_memory = low_memory or (self.args.get('low_memory', False))
@@ -237,6 +249,8 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
         coords = torch.arange(w, dtype=torch.float, device=init_disp.device).reshape(1,1,w,1).repeat(b, h, 1, 1)  # (B,H,W,1) Horizontal only
         disp = init_disp.float()
         disp_preds = []
+        edge_map = None
+        edge_loss = None
 
         # GRUs iterations to update disparity (1/4 resolution)
         for itr in range(iters):
@@ -251,12 +265,36 @@ class FoundationStereo(nn.Module, huggingface_hub.PyTorchModelHubMixin):
 
             # upsample predictions
             disp_up = self.upsample_disp(disp.float(), mask_feat_4.float(), stem_2x.float())
+            
+            # Edge-Aware Residual Refinement (only after last iteration)
+            if itr == iters - 1 and self.use_earr:
+                with autocast(enabled=self.args.mixed_precision):
+                    # 上采样特征图到原始分辨率用于EARR
+                    feat_left_upsampled = F.interpolate(features_left[0], size=disp_up.shape[-2:], 
+                                                       mode='bilinear', align_corners=True)
+                    
+                    if return_edge_info:
+                        disp_up, edge_map, edge_loss = self.earr(
+                            disp_up, feat_left_upsampled, image1, 
+                            return_edge_loss=True
+                        )
+                    else:
+                        disp_up, edge_map = self.earr(
+                            disp_up, feat_left_upsampled, image1,
+                            return_edge_loss=False
+                        )
+            
             disp_preds.append(disp_up)
 
 
         if test_mode:
+            if return_edge_info:
+                return disp_up, edge_map, edge_loss
             return disp_up
 
+        if return_edge_info:
+            return init_disp, disp_preds, edge_map, edge_loss
+        
         return init_disp, disp_preds
 
 
