@@ -13,6 +13,6 @@ python scripts/train_d435i.py --epochs 500 --batch_size 2 --lr 1e-4 --out_dir ./
 python scripts/train_d435i.py --epochs 500 --batch_size 4 --accum_steps 4 --img_scale 0.3 --low_memory --mixed_precision --out_dir ./train_output_ir/ —use-earr
 
 - 训练ir图像，不使用earr
-python scripts/train_d435i.py --epochs 500 --batch_size 4 --accum_steps 4 --img_scale 0.3 --low_memory --mixed_precision --out_dir ./train_output_ir/ --no_earr
+python scripts/train_d435i.py --epochs 500 --batch_size 4 --accum_steps 4 --img_scale 0.3 --low_memory --mixed_precision --out_dir ./train_output_ir/ 
 
 

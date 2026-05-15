@@ -442,7 +442,7 @@ def main():
     parser.add_argument('--vit_size', default='vitl', type=str, choices=['vits', 'vitb', 'vitl', 'vitg'])
     parser.add_argument('--low_memory', action='store_true', default=True, help='Enable low memory mode')
     parser.add_argument('--mixed_precision', action='store_true', default=True, help='Enable mixed precision training')
-    parser.add_argument('--use_earr', action='store_true', default=True, help='Enable Edge-Aware Residual Refinement (EARR) module')
+    parser.add_argument('--use_earr', action='store_true', default=False, help='Enable Edge-Aware Residual Refinement (EARR) module')
     
     # Training settings
     parser.add_argument('--epochs', default=500, type=int)
